@@ -40,6 +40,10 @@ import uuid
 import time
 import logging
 import warnings
+import os
+import subprocess
+import sys
+import ast
 
 from math import log2
 from collections import Counter
@@ -458,6 +462,7 @@ class DmSimulatorPy_Base(BackendV1):
 
         self._xxyy_error = self._xxyy_error*couples if self._xxyy_error is not None else None
         self._zz_error = self._zz_error*couples if self._zz_error is not None else None
+        self._densitymatrix1 = self._densitymatrix.copy()
 
 
     def _validate_initial_densitymatrix(self):
@@ -479,6 +484,8 @@ class DmSimulatorPy_Base(BackendV1):
                 "Trace of initial densitymatrix is not one: " + "{} != {}".format(self._den[0], 1)
             )
         self._densitymatrix = np.reshape(self._densitymatrix, self._number_of_qubits * [4])
+        #self._densitymatrix = repr(self._densitymatrix.tolist())
+        #self._densitymatrix1 = self._densitymatrix.copy()
 
     def _add_unitary_single(self, gate, qubit):
         """Apply an arbitrary 1-qubit unitary transformation.
@@ -491,17 +498,8 @@ class DmSimulatorPy_Base(BackendV1):
         # changing density matrix
         lt, mt, rt = 4**qubit, 4, 4 ** (self._number_of_qubits - qubit - 1)
         self._densitymatrix = np.reshape(self._densitymatrix, (lt, mt, rt))
-
         for idx in gate:  # For Rotations in the Decomposed Gate list
-            # self._densitymatrix = rot_gate_dm_matrix(
-            #     idx[0],
-            #     idx[1],
-            #     self._error_params["one_qubit_gates"][idx[0]],
-            #     self._densitymatrix,
-            #     qubit,
-            #     self._number_of_qubits,
-            # )
-
+            #self._densitymatrix = 
             rot_gate_dm_matrix(
                 idx[0],
                 idx[1],
@@ -510,9 +508,57 @@ class DmSimulatorPy_Base(BackendV1):
                 qubit,
                 self._number_of_qubits,
             )
-
         self._densitymatrix = np.reshape(self._densitymatrix, self._number_of_qubits * [4])
 
+    def _mpi_unitary_single(self, gate, qubit):
+        """Apply an arbitrary 1-qubit unitary transformation.
+
+        Args:
+            gate (list): the type of gate (u1, u2 or u3) together with its parameters.
+            qubit (int): the qubit to apply the gate to.
+        """
+        
+        # changing density matrix
+        lt, mt, rt = 4**qubit, 4, 4 ** (self._number_of_qubits - qubit - 1)
+        self._densitymatrix = np.reshape(self._densitymatrix, (lt, mt, rt))
+        self._densitymatrix = (repr(self._densitymatrix.tolist()))
+
+        for idx in gate:
+            self._densitymatrix = self._unitary_single_rot(
+                idx[0],
+                idx[1],
+                self._error_params["one_qubit_gates"][idx[0]],
+                self._densitymatrix,
+                qubit,
+                self._number_of_qubits
+            )
+        self._densitymatrix = np.reshape(np.array(self._densitymatrix).flatten(), self._number_of_qubits * [4])
+    
+        return self._densitymatrix
+
+    def _unitary_single_rot(self, gate, param, err_param, state, q, num_qubits):
+        # Convert string-form state to actual array (if needed)
+        state_arr = np.array(ast.literal_eval(state)) if isinstance(state, str) else state
+    
+        # Save state to file
+        uid = str(uuid.uuid4())
+        input_file = f"input_{uid}.npy"
+        output_file = f"output_{uid}.npy"
+        np.save(input_file, state_arr)
+    
+        # Launch MPI job
+        cmd = f'mpiexec -n 5 python mpi_unitary_single.py {gate} {param} "{err_param}" {input_file} {output_file} {q} {num_qubits}'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    
+        # Load result
+        if os.path.exists(output_file):
+            new_state = np.load(output_file)
+            os.remove(input_file)
+            os.remove(output_file)
+            return new_state
+        else:
+            raise RuntimeError("MPI failed:\n" + result.stderr)
+    
     def _add_unitary_two(self, qubit0, qubit1):
         """Apply a two-qubit unitary transformation (only cx gate is included).
 
@@ -1158,7 +1204,7 @@ class DmSimulatorPy_Base(BackendV1):
         # return result
         # return Result(**result)
         return Result.from_dict(result)
-
+    
     def run_experiment(self, experiment):
         """Run an experiment (circuit) and return a single experiment result.
 
@@ -1251,7 +1297,8 @@ class DmSimulatorPy_Base(BackendV1):
                     params = getattr(operation, "params", None)
                     gate = single_gate_dm_matrix(operation.name, params)
                     qubit = operation.qubits[0]
-                    self._add_unitary_single(gate, qubit)
+                    #self._add_unitary_single(gate, qubit)
+                    self._mpi_unitary_single(gate, qubit)
                 # Check if Allowed Two Qubit Gate
                 elif operation.name in self._two_qubit_gates:
                     qubit0 = operation.qubits[0]
@@ -1410,7 +1457,6 @@ class DmSimulatorPy_Base(BackendV1):
                     backend = self.name()
                     err_msg = '{0} encountered unrecognized operation "{1}"'
                     raise BasicAerError(err_msg.format(backend, operation.name))
-
         
             # Add Memory errors at the end of each clock cycle
             if self._decoherence_and_amp_decay_applied is True:
@@ -1448,7 +1494,7 @@ class DmSimulatorPy_Base(BackendV1):
             "processing_time_taken": -start_processing + end_processing,
             "running_time_taken": -start_runtime + end_runtime,
             "header": experiment.header.to_dict(),
-            "shots": 0
+            "shots": 0,
         }
 
     def _compute_densitymatrix(self, dmpauli):
